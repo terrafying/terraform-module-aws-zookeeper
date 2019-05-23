@@ -20,7 +20,7 @@ data "aws_ami" "zookeeper" {
   owners      = ["self"]
   filter {
     name   = "architecture"
-    values = ["x86_64"]
+    values = ["arm64"]
   }
   filter {
     name   = "name"
