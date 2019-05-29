@@ -27,11 +27,6 @@ output "security_group" {
   value     = aws_security_group.zookeeper.id
 }
 
-output "security_group_monit" {
-  sensitive = false
-  value     = aws_security_group.zookeeper_monit.id
-}
-
 output "ssh_key" {
   sensitive = false
   value     = var.keyname

@@ -7,7 +7,7 @@
 
 data "aws_ami" "zookeeper" {
   most_recent = true
-  name_regex  = "^${var.prefix}${var.name}.*"
+  //name_regex  = "^${var.prefix}${var.name}.*"
   owners      = ["self"]
   filter {
     name   = "architecture"
@@ -23,8 +23,20 @@ data "aws_ami" "zookeeper" {
   }
 }
 
+locals {
+  security_group_ids = flatten(
+    list( 
+      list(
+        aws_security_group.zookeeper.id, 
+        aws_security_group.zookeeper_intra.id
+      ),
+      var.extra_security_group_ids
+    )
+  )
+}
+
 #
-# Apache Zookeeper instance(s).
+# Apache Zookeeper (& kafka) instance(s).
 #
 
 resource "aws_instance" "zookeeper" {
@@ -35,7 +47,7 @@ resource "aws_instance" "zookeeper" {
   key_name                    = var.keyname
   subnet_id                   = element(var.subnet_ids, count.index)
   user_data                   = element(data.template_file.zookeeper.*.rendered, count.index)
-  vpc_security_group_ids      = [aws_security_group.zookeeper.id, aws_security_group.zookeeper_intra.id, var.extra_security_group_id]
+  vpc_security_group_ids      = local.security_group_ids
   root_block_device {
     volume_size = var.root_volume_size
     volume_type = var.root_volume_type
@@ -46,6 +58,11 @@ resource "aws_instance" "zookeeper" {
     Zookeeper = "true"
     Service   = "Zookeeper"
   }
+  lifecycle {
+    ignore_changes = [
+      user_data,
+    ]
+  }
 }
 
 data "template_file" "zookeeper" {
@@ -54,7 +71,8 @@ data "template_file" "zookeeper" {
   vars = {
     domain         = var.domain
     hostname       = "${var.prefix}${var.name}${format("%02d", count.index + 1)}"
-    zookeeper_args = "-i ${count.index + 1} -n ${join(",", data.template_file.zookeeper_id.*.rendered)} ${var.heap_size == "" ? var.heap_size : "-m var.heap_size"}"
+    zookeeper_args = "-i ${count.index + 1} -n ${join(",", data.template_file.zookeeper_id.*.rendered)} ${var.heap_size == "" ? "" : "-m ${var.heap_size}"}"
+    kafka_args = "-i ${count.index + 1} -z zookeeper0${count.index + 1}.${var.env}.brivo.net:2181"
   }
 }
 
@@ -110,7 +128,7 @@ resource "aws_launch_configuration" "zookeeper" {
   instance_type               = var.instance_type
   key_name                    = var.keyname
   name_prefix                 = "${var.prefix}${var.name}-"
-  security_groups             = [aws_security_group.zookeeper.id, aws_security_group.zookeeper_intra.id, var.extra_security_group_id]
+  security_groups             = local.security_group_ids
   user_data                   = data.template_file.zookeeper_asg[0].rendered
   lifecycle {
     create_before_destroy = true
@@ -125,7 +143,8 @@ data "template_file" "zookeeper_asg" {
     eni_reference  = "${var.prefix}${var.name}"
     hostname       = "${var.prefix}${var.name}"
     zookeeper_addr = join(",", data.template_file.zookeeper_asg_addr.*.rendered)
-    zookeeper_args = "-n ${join(",", data.template_file.zookeeper_id.*.rendered)} ${var.heap_size == "" ? var.heap_size : "-m var.heap_size"}"
+    zookeeper_args = "-n ${join(",", data.template_file.zookeeper_id.*.rendered)} ${var.heap_size == "" ? "" : "-m ${var.heap_size}"}"
+    kafka_args = var.heap_size == "" ? "" : "-m ${var.heap_size}"
   }
 }
 
@@ -217,23 +236,23 @@ EOF
 #
 
 resource "aws_network_interface" "zookeeper" {
-count             = var.use_asg ? var.number_of_instances : 0
-subnet_id         = element(var.subnet_ids, count.index)
-security_groups   = [aws_security_group.zookeeper.id, aws_security_group.zookeeper_intra.id, var.extra_security_group_id]
-source_dest_check = false
-tags = {
-Name      = "${var.prefix}${var.name}${format("%02d", count.index + 1)}"
-Reference = "${var.prefix}${var.name}"
-Zookeeper = "true"
-Service   = "Zookeeper"
-}
+  count             = var.use_asg ? var.number_of_instances : 0
+  subnet_id         = element(var.subnet_ids, count.index)
+  security_groups   = local.security_group_ids
+  source_dest_check = false
+  tags = {
+  Name      = "${var.prefix}${var.name}${format("%02d", count.index + 1)}"
+  Reference = "${var.prefix}${var.name}"
+  Zookeeper = "true"
+  Service   = "Zookeeper"
+  }
 }
 
 resource "aws_eip" "zookeeper" {
-count             = var.use_asg && var.associate_public_ip_address ? var.number_of_instances : 0
-depends_on        = [aws_network_interface.zookeeper]
-network_interface = element(aws_network_interface.zookeeper.*.id, count.index)
-vpc               = true
+  count             = var.use_asg && var.associate_public_ip_address ? var.number_of_instances : 0
+  depends_on        = [aws_network_interface.zookeeper]
+  network_interface = element(aws_network_interface.zookeeper.*.id, count.index)
+  vpc               = true
 }
 
 #
@@ -243,37 +262,38 @@ vpc               = true
 resource "aws_route53_record" "private" {
 count = var.private_zone_id != "" ? var.number_of_instances : 0
 name  = "${var.prefix}${var.name}${format("%02d", count.index + 1)}"
-records = [var.use_asg ? element(
-split(
-",",
-replace(
-replace(
-replace(
-format("%s", aws_network_interface.zookeeper.*.private_ips),
-"/[^\\s\\d\\.]/",
-"",
-),
-"/(\\d)\\s+/",
-"$1,",
-),
-"/\\s+/",
-"",
-),
-),
-count.index,
-) : element(aws_instance.zookeeper.*.private_ip, count.index)]
+records = [
+  var.use_asg ? element(
+    split(
+      ",",
+      replace(
+        replace(
+          replace(
+            format("%s", aws_network_interface.zookeeper.*.private_ips),
+            "/[^\\s\\d\\.]/",
+            "",
+          ),
+          "/(\\d)\\s+/",
+          "$1,",
+        ),
+        "/\\s+/",
+        "",
+      ),
+    ),
+    count.index,
+  ) : element(aws_instance.zookeeper.*.private_ip, count.index)]
 ttl     = var.ttl
 type    = "A"
 zone_id = var.private_zone_id
 }
 
 resource "aws_route53_record" "public" {
-count   = var.public_zone_id != "" && var.associate_public_ip_address ? var.number_of_instances : 0
-name    = "${var.prefix}${var.name}${format("%02d", count.index + 1)}"
-records = [var.use_asg ? element(aws_eip.zookeeper.*.public_ip, count.index) : element(aws_instance.zookeeper.*.public_ip, count.index)]
-ttl     = var.ttl
-type    = "A"
-zone_id = var.public_zone_id
+  count   = var.public_zone_id != "" && var.associate_public_ip_address ? var.number_of_instances : 0
+  name    = "${var.prefix}${var.name}${format("%02d", count.index + 1)}"
+  records = [var.use_asg ? element(aws_eip.zookeeper.*.public_ip, count.index) : element(aws_instance.zookeeper.*.public_ip, count.index)]
+  ttl     = var.ttl
+  type    = "A"
+  zone_id = var.public_zone_id
 }
 
 #
@@ -281,71 +301,78 @@ zone_id = var.public_zone_id
 #
 
 resource "aws_security_group" "zookeeper" {
-name   = "${var.prefix}${var.name}"
-vpc_id = var.vpc_id
-ingress {
-from_port = 2181
-to_port   = 2181
-protocol  = "tcp"
-self      = true
-}
-lifecycle {
-create_before_destroy = true
-}
-tags = {
-Name      = "${var.prefix}${var.name}"
-Zookeeper = "true"
-Service   = "Zookeeper"
-}
+  name   = "${var.prefix}${var.name}"
+  vpc_id = var.vpc_id
+  ingress {
+    from_port = 22
+    to_port = 22
+    protocol = "tcp"
+    cidr_blocks = ["10.58.0.0/16"]
+  }
+  ingress {
+    from_port = 2181
+    to_port   = 2181
+    protocol  = "tcp"
+    self      = true
+  }
+  ingress {
+    from_port = 2181
+    to_port   = 2181
+    protocol  = "tcp"
+    cidr_blocks = ["10.58.0.0/16"]
+  }
+  ingress {
+    description = "kafka"
+    from_port = 9092
+    to_port   = 9092
+    protocol  = "tcp"
+    cidr_blocks = ["10.58.0.0/16"]
+  }
+  ingress {
+    from_port = 2888
+    to_port   = 2888
+    protocol  = "tcp"
+    self      = true
+  }
+  ingress {
+    from_port = 3888
+    to_port   = 3888
+    protocol  = "tcp"
+    self      = true
+  }
+  ingress {
+      from_port = 7199
+      to_port   = 7199
+      protocol  = "tcp"
+      self      = true
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  lifecycle {
+    create_before_destroy = true
+  }
+  tags = {
+    Name      = "${var.prefix}${var.name}"
+    Zookeeper = "true"
+    Kafka = "true"
+    Service   = "Zookeeper"
+  }
 }
 
 resource "aws_security_group" "zookeeper_intra" {
-name   = "${var.prefix}${var.name}-intra"
-vpc_id = var.vpc_id
-ingress {
-from_port = 2888
-to_port   = 2888
-protocol  = "tcp"
-self      = true
+  name   = "${var.prefix}${var.name}-intra"
+  vpc_id = var.vpc_id
+  
+  lifecycle {
+    create_before_destroy = true
+  }
+  tags = {
+    Name      = "${var.prefix}${var.name}-intra"
+    Zookeeper = "true"
+    Service   = "Zookeeper_intra"
+  }
 }
-ingress {
-from_port = 3888
-to_port   = 3888
-protocol  = "tcp"
-self      = true
-}
-egress {
-from_port   = 0
-to_port     = 0
-protocol    = "-1"
-cidr_blocks = ["0.0.0.0/0"]
-}
-lifecycle {
-create_before_destroy = true
-}
-tags = {
-Name      = "${var.prefix}${var.name}-intra"
-Zookeeper = "true"
-Service   = "Zookeeper"
-}
-}
-
-resource "aws_security_group" "zookeeper_monit" {
-name   = "${var.prefix}${var.name}-monit"
-vpc_id = var.vpc_id
-ingress {
-from_port = 7199
-to_port   = 7199
-protocol  = "tcp"
-self      = true
-}
-lifecycle {
-create_before_destroy = true
-}
-tags = {
-Name      = "${var.prefix}${var.name}-monit"
-Zookeeper = "true"
-Service   = "Zookeeper"
-}
-}
-

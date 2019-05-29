@@ -39,10 +39,10 @@ variable "domain" {
   type        = string
 }
 
-variable "extra_security_group_id" {
-  description = "Extra security group to assign to the Apache Zookeeper instance(s) (e.g.: 'sg-3f983f98')."
-  default     = ""
-  type        = string
+variable "extra_security_group_ids" {
+  description = "Extra security groups to assign to the Apache Zookeeper instance(s)."
+  default     = []
+  type        = list(string)
 }
 
 variable "heap_size" {
@@ -100,7 +100,7 @@ variable "root_volume_iops" {
 
 variable "root_volume_size" {
   description = "The volume size in gigabytes."
-  default     = "8"
+  default     = "30"
   type        = string
 }
 
@@ -132,3 +132,8 @@ variable "vpc_id" {
   type        = string
 }
 
+variable "env" {
+  description = "Environment - as in name.env.brivo.net"
+  default = "sdi"
+  type = string
+}
